@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VantaAuth | Secure Gateway</title>
+    <link rel="stylesheet" href="style.css"> <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <style>
+        /* Extra CSS für den Editor */
+        .editor-container { background: #111; border: 1px solid #333; padding: 10px; border-radius: 8px; margin-top: 15px; }
+        .code-textarea { width: 100%; height: 200px; background: #0f0f0f; color: #00ff00; border: none; font-family: monospace; padding: 10px; resize: vertical; outline: none; }
+        .toggle-auth { margin-top: 10px; cursor: pointer; color: var(--accent-color); font-size: 0.8rem; text-decoration: underline; }
+    </style>
+</head>
+<body class="theme-black">
+
+    <div id="auth-container" class="fade-in">
+        <div class="auth-box">
+            <div class="logo-area">
+                <h1>VantaAuth</h1>
+                <p id="auth-title">Login to Dashboard</p>
+            </div>
+
+            <div class="input-group">
+                <i class="fas fa-user"></i>
+                <input type="text" id="username" placeholder="Username">
+            </div>
+            <div class="input-group">
+                <i class="fas fa-lock"></i>
+                <input type="password" id="password" placeholder="Password">
+            </div>
+
+            <button onclick="handleAuth()" class="btn-primary" id="auth-btn">Login</button>
+            <p class="toggle-auth" onclick="toggleAuthMode()">No account? Register here</p>
+
+            <div class="auth-footer">
+                <div class="credits-mini">Maindev: .nxb. | Owner: LucaGamingFan1234</div>
+            </div>
+        </div>
+    </div>
+
+    <div id="dashboard-container" class="hidden">
+        <div class="sidebar">
+            <h2>VantaAuth</h2>
+            <div class="user-info">
+                <div class="avatar-circle"><i class="fas fa-user"></i></div>
+                <span id="display-username">User</span>
+            </div>
+            <nav>
+                <button class="nav-btn active" onclick="openTab('tab-keys')"><i class="fas fa-key"></i> Keys</button>
+                <button class="nav-btn" onclick="openTab('tab-editor')"><i class="fas fa-code"></i> Script Editor</button>
+            </nav>
+            <button class="logout-btn" onclick="location.reload()">Logout</button>
+        </div>
+
+        <div class="main-content">
+            <div id="tab-keys" class="tab-content active-tab">
+                <h3>License Keys</h3>
+                <div class="toolbar">
+                    <button class="btn-small" onclick="createKey()">+ Create Key</button>
+                </div>
+                <div id="key-list" class="script-grid">
+                    </div>
+            </div>
+
+            <div id="tab-editor" class="tab-content">
+                <h3>Lua Script Editor</h3>
+                <div class="card">
+                    <input type="text" id="script-name" placeholder="Script Name (e.g. BloxFruit Farm)" class="search-bar" style="width: 100%; margin-bottom: 10px;">
+                    <div class="editor-container">
+                        <textarea id="script-content" class="code-textarea" placeholder="-- Paste your Lua Source here..."></textarea>
+                    </div>
+                    <div style="margin-top: 10px; display: flex; gap: 10px;">
+                        <button class="btn-small" onclick="saveScript()">Save Script</button>
+                        <button class="btn-small" style="background: #333;" onclick="insertAPITemplate()">Insert Auth Template</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
