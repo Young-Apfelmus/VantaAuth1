@@ -1,175 +1,165 @@
-// server.js - DAS BACKEND
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const bcrypt = require('bcryptjs');
-const path = require('path');
+const crypto = require('crypto'); // Neu für Secrets
 
 const app = express();
-const PORT = 3000; // Oder process.env.PORT für Cloudflare/Render
+const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(bodyParser.json());
-//app.use(express.static('public')); // Frontend Dateien bereitstellen
 
-// --- MOCK DATABASE (Später durch MongoDB/SQL ersetzen) ---
-let users = []; // { username, passwordHash, role, hwid }
-let keys = [];  // { key, generatedBy, usedBy, hwid, expires, scriptContent }
-let scripts = []; // { id, name, content, owner }
+// --- DATABASE ---
+let users = []; 
+let apps = []; // Neu: { id, name, owner, secret }
+let keys = []; // Update: { key, appId, ... }
+let scripts = [];
+
+// --- HELPER ---
+function generateId(length) {
+    return crypto.randomBytes(length).toString('hex').slice(0, length);
+}
 
 // --- AUTH ROUTEN ---
-
-// Register
 app.post('/api/register', async (req, res) => {
     const { username, password } = req.body;
-    if (users.find(u => u.username === username)) {
-        return res.json({ success: false, message: "User exists already." });
-    }
-    // Passwort verschlüsseln (Hashing)
+    if (users.find(u => u.username === username)) return res.json({ success: false, message: "Taken." });
     const hashedPassword = await bcrypt.hash(password, 10);
-    
-    users.push({ 
-        username, 
-        password: hashedPassword, 
-        role: username === "LucaGamingFan1234" ? "owner" : "user" // Auto-Owner Logic
-    });
-    
-    res.json({ success: true, message: "Registered successfully!" });
+    users.push({ username, password: hashedPassword, role: "user" }); // Erster User könnte Owner sein
+    res.json({ success: true });
 });
 
-// Login
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
     const user = users.find(u => u.username === username);
-    
-    if (!user) return res.json({ success: false, message: "User not found." });
-
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) return res.json({ success: false, message: "Wrong password." });
-
-    res.json({ success: true, username: user.username, role: user.role });
+    if (!user || !(await bcrypt.compare(password, user.password))) return res.json({ success: false, message: "Invalid credentials" });
+    res.json({ success: true, username: user.username });
 });
 
-// --- KEY MANAGEMENT ROUTEN ---
-
-// Key erstellen (Nur im Dashboard)
-app.post('/api/create-key', (req, res) => {
-    const { owner, duration } = req.body; // duration in days
+// --- APP MANAGEMENT (NEU) ---
+app.post('/api/create-app', (req, res) => {
+    const { name, owner } = req.body;
+    const appId = generateId(10);     // Z.B. "a1b2c3d4e5"
+    const secret = generateId(32);    // Langes Secret für Sicherheit
     
-    // Generiere Vanta-Style Key
+    apps.push({ id: appId, name, owner, secret });
+    res.json({ success: true, app: { id: appId, name, secret } });
+});
+
+app.get('/api/my-apps', (req, res) => {
+    const { owner } = req.query;
+    const myApps = apps.filter(a => a.owner === owner);
+    res.json(myApps);
+});
+
+// --- KEY MANAGEMENT ---
+app.post('/api/create-key', (req, res) => {
+    const { owner, appId, duration } = req.body;
+    
+    // Prüfen ob App existiert
+    const application = apps.find(a => a.id === appId);
+    if (!application) return res.json({ success: false, message: "App not found" });
+
     const keyPart = Math.random().toString(36).substring(2, 8).toUpperCase();
     const newKey = `VNT-${keyPart}-PREM`;
     
     keys.push({
         key: newKey,
+        appId: appId, // WICHTIG: Key gehört jetzt zu dieser App
+        appName: application.name,
         generatedBy: owner,
-        usedBy: null,
         hwid: null,
-        active: true,
-        expires: "Lifetime" // Vereinfacht für Demo
+        active: true
     });
 
     res.json({ success: true, key: newKey });
 });
 
-// Scripts abrufen
-app.get('/api/scripts', (req, res) => {
-    // Hier würde man nur Scripts senden, die dem User gehören
-    res.json(scripts); 
+app.get('/api/my-keys', (req, res) => {
+    // Hier könnten wir filtern
+    res.json(keys);
 });
 
-// Neues Script speichern
-app.post('/api/save-script', (req, res) => {
-    const { name, content, owner } = req.body;
-    scripts.push({ id: Date.now(), name, content, owner });
-    res.json({ success: true, message: "Script saved." });
-});
-
-// --- NEUE ROUTE: LUA LOADER ---
-// Das hier sendet das ECHTE Lua Script an den Client
+// --- LUA API (UPDATED) ---
 app.get('/api/lua/loader', (req, res) => {
+    // Der Loader akzeptiert jetzt App-Daten
     const luaScript = `
 local VantaAuth = {}
 local HttpService = game:GetService("HttpService")
+local StarterGui = game:GetService("StarterGui")
 
-function VantaAuth:RedeemKey(key)
-    local url = "https://vantaauth1.onrender.com/api/lua/verify" -- Deine URL
-    
-    -- HWID automatisch ermitteln
+function VantaAuth.Login(appId, appSecret, key)
+    local url = "https://vantaauth1.onrender.com/api/lua/verify"
     local hwid = game:GetService("RbxAnalyticsService"):GetClientId()
     
-    -- Request Body bauen
     local body = HttpService:JSONEncode({
+        appId = appId,
+        appSecret = appSecret,
         key = key,
         hwid = hwid
     })
 
-    -- Den Request senden (POST)
     local response = request({
         Url = url,
         Method = "POST",
-        Headers = {
-            ["Content-Type"] = "application/json"
-        },
+        Headers = { ["Content-Type"] = "application/json" },
         Body = body
     })
 
     if response.StatusCode == 200 then
         local data = HttpService:JSONDecode(response.Body)
         if data.valid then
-            print("VantaAuth: Success!")
-            -- Hier führen wir das geschützte Script aus, das der Server schickt
-            loadstring(data.script)() 
+            
+            StarterGui:SetCore("SendNotification", {
+                Title = "VantaAuth",
+                Text = "Login Successful!",
+                Duration = 5
+            })
+            
+            -- Geschütztes Script ausführen
+            loadstring(data.script)()
         else
-            warn("VantaAuth: " .. (data.message or "Invalid Key"))
-            game.Players.LocalPlayer:Kick("Invalid Key")
+            game.Players.LocalPlayer:Kick("Auth Failed: " .. (data.message or "Unknown"))
         end
     else
-        warn("VantaAuth: Server Error " .. response.StatusCode)
+        warn("Connection Error")
     end
 end
 
 return VantaAuth
     `;
-    
     res.send(luaScript);
 });
 
-
-// --- LUA API ENDPOINT (Das hier nutzt das Roblox Script) ---
-// Checkt: Stimmt Key? Stimmt HWID?
 app.post('/api/lua/verify', (req, res) => {
-    const { key, hwid } = req.body;
+    const { appId, appSecret, key, hwid } = req.body;
     
+    // 1. App Check
+    const appData = apps.find(a => a.id === appId);
+    if (!appData) return res.json({ valid: false, message: "Invalid Application ID" });
+    if (appData.secret !== appSecret) return res.json({ valid: false, message: "Invalid App Secret" });
+
+    // 2. Key Check
     const keyData = keys.find(k => k.key === key);
+    if (!keyData) return res.json({ valid: false, message: "Key not found" });
+
+    // 3. Cross-Check: Gehört der Key zur App?
+    if (keyData.appId !== appId) return res.json({ valid: false, message: "Key belongs to another app" });
+
+    // 4. HWID Logic
+    if (!keyData.active) return res.json({ valid: false, message: "Key Blacklisted" });
     
-    if (!keyData) {
-        return res.json({ valid: false, message: "Key not found" });
-    }
-
-    if (!keyData.active) {
-        return res.json({ valid: false, message: "Key blacklisted" });
-    }
-
-    // Wenn Key noch unbenutzt, binde HWID (Linken)
     if (!keyData.hwid) {
-        keyData.hwid = hwid;
-        keyData.usedBy = "RedeemedUser"; // Hier könnte man Usernamen loggen
-    } else {
-        // Wenn Key benutzt, prüfe ob HWID stimmt
-        if (keyData.hwid !== hwid) {
-            return res.json({ valid: false, message: "Invalid HWID" });
-        }
+        keyData.hwid = hwid; // Link HWID
+    } else if (keyData.hwid !== hwid) {
+        return res.json({ valid: false, message: "Invalid HWID" });
     }
 
     res.json({ 
         valid: true, 
-        message: "Authenticated", 
-        script: `print('Welcome to VantaAuth!'); -- Hier Loadstring laden`
+        script: `print("Hello from ${appData.name}!")` // Hier später echtes Skript laden
     });
 });
 
-// Server Starten
-app.listen(PORT, () => {
-    console.log(`VantaAuth Backend running on http://localhost:${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server on ${PORT}`));
