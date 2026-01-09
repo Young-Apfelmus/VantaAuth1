@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const bcrypt = require('bcryptjs');
-const crypto = require('crypto'); // Neu für Secrets
+const crypto = require('crypto'); // Für Secrets
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -10,156 +10,149 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(bodyParser.json());
 
-// --- DATABASE ---
+// --- IN-MEMORY DATENBANK ---
 let users = []; 
-let apps = []; // Neu: { id, name, owner, secret }
-let keys = []; // Update: { key, appId, ... }
-let scripts = [];
+let apps = []; // { id, name, owner, secret, totalUsers, onlineUsers }
+let keys = []; // { key, appId, generatedBy, hwid, ip, status }
+let logs = []; // { time, appId, appName, key, ip, message }
 
 // --- HELPER ---
-function generateId(length) {
-    return crypto.randomBytes(length).toString('hex').slice(0, length);
-}
+function generateId(len) { return crypto.randomBytes(len).toString('hex').slice(0, len); }
+function getTime() { return new Date().toISOString().replace('T', ' ').substring(0, 19); }
 
-// --- AUTH ROUTEN ---
+// --- AUTH ---
 app.post('/api/register', async (req, res) => {
     const { username, password } = req.body;
-    if (users.find(u => u.username === username)) return res.json({ success: false, message: "Taken." });
+    if (users.find(u => u.username === username)) return res.json({ success: false, message: "Taken" });
     const hashedPassword = await bcrypt.hash(password, 10);
-    users.push({ username, password: hashedPassword, role: "user" }); // Erster User könnte Owner sein
+    users.push({ username, password: hashedPassword });
     res.json({ success: true });
 });
 
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
     const user = users.find(u => u.username === username);
-    if (!user || !(await bcrypt.compare(password, user.password))) return res.json({ success: false, message: "Invalid credentials" });
+    if (!user || !(await bcrypt.compare(password, user.password))) return res.json({ success: false });
     res.json({ success: true, username: user.username });
 });
 
-// --- APP MANAGEMENT (NEU) ---
-app.post('/api/create-app', (req, res) => {
-    const { name, owner } = req.body;
-    const appId = generateId(10);     // Z.B. "a1b2c3d4e5"
-    const secret = generateId(32);    // Langes Secret für Sicherheit
-    
-    apps.push({ id: appId, name, owner, secret });
-    res.json({ success: true, app: { id: appId, name, secret } });
-});
-
+// --- APP MANAGEMENT ---
 app.get('/api/my-apps', (req, res) => {
     const { owner } = req.query;
+    // Wir senden Apps + deren Stats zurück
     const myApps = apps.filter(a => a.owner === owner);
     res.json(myApps);
 });
 
-// --- KEY MANAGEMENT ---
+app.post('/api/create-app', (req, res) => {
+    const { name, owner } = req.body;
+    const appId = generateId(10);
+    const secret = generateId(40); // Langes Secret
+    
+    apps.push({ 
+        id: appId, 
+        name, 
+        owner, 
+        secret, 
+        totalUsers: 0, 
+        onlineUsers: 0 
+    });
+    res.json({ success: true });
+});
+
+// --- KEY & LOGS ---
 app.post('/api/create-key', (req, res) => {
     const { owner, appId, duration } = req.body;
-    
-    // Prüfen ob App existiert
     const application = apps.find(a => a.id === appId);
-    if (!application) return res.json({ success: false, message: "App not found" });
+    if(!application) return res.json({ success: false });
 
-    const keyPart = Math.random().toString(36).substring(2, 8).toUpperCase();
-    const newKey = `VNT-${keyPart}-PREM`;
+    const keyStr = `VNT-${generateId(4).toUpperCase()}-${generateId(4).toUpperCase()}`;
     
     keys.push({
-        key: newKey,
-        appId: appId, // WICHTIG: Key gehört jetzt zu dieser App
+        key: keyStr,
+        appId: appId,
         appName: application.name,
         generatedBy: owner,
         hwid: null,
+        ip: null,
         active: true
     });
-
-    res.json({ success: true, key: newKey });
+    
+    res.json({ success: true, key: keyStr });
 });
 
-app.get('/api/my-keys', (req, res) => {
-    // Hier könnten wir filtern
-    res.json(keys);
+// Gibt Keys UND Logs zurück
+app.get('/api/dashboard-data', (req, res) => {
+    const { owner } = req.query;
+    // Filtern: Nur Daten, die dem User gehören (via Apps)
+    const myAppIds = apps.filter(a => a.owner === owner).map(a => a.id);
+    
+    const myKeys = keys.filter(k => myAppIds.includes(k.appId));
+    const myLogs = logs.filter(l => myAppIds.includes(l.appId)).reverse(); // Neueste zuerst
+
+    res.json({ keys: myKeys, logs: myLogs });
 });
 
-// --- LUA API (UPDATED) ---
+// --- LUA VERIFY (Das Herzstück) ---
 app.get('/api/lua/loader', (req, res) => {
-    // Der Loader akzeptiert jetzt App-Daten
-    const luaScript = `
-local VantaAuth = {}
-local HttpService = game:GetService("HttpService")
-local StarterGui = game:GetService("StarterGui")
+    const lua = `
+local Vanta = {}
+local Http = game:GetService("HttpService")
 
-function VantaAuth.Login(appId, appSecret, key)
+function Vanta.Login(appId, secret, key)
     local url = "https://vantaauth1.onrender.com/api/lua/verify"
     local hwid = game:GetService("RbxAnalyticsService"):GetClientId()
     
-    local body = HttpService:JSONEncode({
-        appId = appId,
-        appSecret = appSecret,
-        key = key,
-        hwid = hwid
-    })
-
-    local response = request({
-        Url = url,
-        Method = "POST",
-        Headers = { ["Content-Type"] = "application/json" },
-        Body = body
-    })
-
-    if response.StatusCode == 200 then
-        local data = HttpService:JSONDecode(response.Body)
+    local body = Http:JSONEncode({ appId=appId, secret=secret, key=key, hwid=hwid })
+    local resp = request({Url=url, Method="POST", Headers={["Content-Type"]="application/json"}, Body=body})
+    
+    if resp.StatusCode == 200 then
+        local data = Http:JSONDecode(resp.Body)
         if data.valid then
-            
-            StarterGui:SetCore("SendNotification", {
-                Title = "VantaAuth",
-                Text = "Login Successful!",
-                Duration = 5
-            })
-            
-            -- Geschütztes Script ausführen
+            print("VantaAuth: Login OK!")
             loadstring(data.script)()
         else
-            game.Players.LocalPlayer:Kick("Auth Failed: " .. (data.message or "Unknown"))
+            game.Players.LocalPlayer:Kick(data.message)
         end
     else
-        warn("Connection Error")
+        warn("Server Error")
     end
 end
-
-return VantaAuth
+return Vanta
     `;
-    res.send(luaScript);
+    res.send(lua);
 });
 
 app.post('/api/lua/verify', (req, res) => {
-    const { appId, appSecret, key, hwid } = req.body;
-    
+    // IP vom Request holen (Render Header)
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    const { appId, secret, key, hwid } = req.body;
+
     // 1. App Check
     const appData = apps.find(a => a.id === appId);
-    if (!appData) return res.json({ valid: false, message: "Invalid Application ID" });
-    if (appData.secret !== appSecret) return res.json({ valid: false, message: "Invalid App Secret" });
+    if (!appData || appData.secret !== secret) return res.json({ valid: false, message: "Invalid App/Secret" });
 
     // 2. Key Check
     const keyData = keys.find(k => k.key === key);
-    if (!keyData) return res.json({ valid: false, message: "Key not found" });
+    if (!keyData) return res.json({ valid: false, message: "Invalid Key" });
+    if (keyData.appId !== appId) return res.json({ valid: false, message: "Key not for this App" });
+    if (!keyData.active) return res.json({ valid: false, message: "Key Banned" });
 
-    // 3. Cross-Check: Gehört der Key zur App?
-    if (keyData.appId !== appId) return res.json({ valid: false, message: "Key belongs to another app" });
-
-    // 4. HWID Logic
-    if (!keyData.active) return res.json({ valid: false, message: "Key Blacklisted" });
-    
+    // 3. HWID & IP Logic
     if (!keyData.hwid) {
-        keyData.hwid = hwid; // Link HWID
+        keyData.hwid = hwid;
+        keyData.ip = ip;
+        appData.totalUsers++; // Statistik hochzählen
     } else if (keyData.hwid !== hwid) {
-        return res.json({ valid: false, message: "Invalid HWID" });
+        // Loggen des fehlgeschlagenen Versuchs
+        logs.push({ time: getTime(), appId, appName: appData.name, key, ip, message: "HWID Mismatch Warning" });
+        return res.json({ valid: false, message: "HWID Mismatch" });
     }
 
-    res.json({ 
-        valid: true, 
-        script: `print("Hello from ${appData.name}!")` // Hier später echtes Skript laden
-    });
+    // Erfolgreicher Login -> Loggen
+    logs.push({ time: getTime(), appId, appName: appData.name, key, ip, message: "Login Success" });
+    
+    res.json({ valid: true, script: `print("Hello ${key} from ${appData.name}")` });
 });
 
-app.listen(PORT, () => console.log(`Server on ${PORT}`));
+app.listen(PORT, () => console.log("Server running"));
