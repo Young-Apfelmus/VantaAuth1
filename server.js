@@ -85,6 +85,56 @@ app.post('/api/save-script', (req, res) => {
     res.json({ success: true, message: "Script saved." });
 });
 
+// --- NEUE ROUTE: LUA LOADER ---
+// Das hier sendet das ECHTE Lua Script an den Client
+app.get('/api/lua/loader', (req, res) => {
+    const luaScript = `
+local VantaAuth = {}
+local HttpService = game:GetService("HttpService")
+
+function VantaAuth:RedeemKey(key)
+    local url = "https://vantaauth1.onrender.com/api/lua/verify" -- Deine URL
+    
+    -- HWID automatisch ermitteln
+    local hwid = game:GetService("RbxAnalyticsService"):GetClientId()
+    
+    -- Request Body bauen
+    local body = HttpService:JSONEncode({
+        key = key,
+        hwid = hwid
+    })
+
+    -- Den Request senden (POST)
+    local response = request({
+        Url = url,
+        Method = "POST",
+        Headers = {
+            ["Content-Type"] = "application/json"
+        },
+        Body = body
+    })
+
+    if response.StatusCode == 200 then
+        local data = HttpService:JSONDecode(response.Body)
+        if data.valid then
+            print("VantaAuth: Success!")
+            -- Hier führen wir das geschützte Script aus, das der Server schickt
+            loadstring(data.script)() 
+        else
+            warn("VantaAuth: " .. (data.message or "Invalid Key"))
+            game.Players.LocalPlayer:Kick("Invalid Key")
+        end
+    else
+        warn("VantaAuth: Server Error " .. response.StatusCode)
+    end
+end
+
+return VantaAuth
+    `;
+    
+    res.send(luaScript);
+});
+
 
 // --- LUA API ENDPOINT (Das hier nutzt das Roblox Script) ---
 // Checkt: Stimmt Key? Stimmt HWID?
