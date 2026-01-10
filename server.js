@@ -15,7 +15,7 @@ const MONGO_URI = process.env.MONGO_URI;
 const DISCORD_CLIENT_ID = "1459637612246597916";
 const DISCORD_CLIENT_SECRET = "y3EwGJXiKnlBM9i-Zh-4goite4-FtGjD";
 const DISCORD_REDIRECT_URI = "https://vantaauth1.onrender.com/auth/discord/callback";
-const FRONTEND_URL = "https://vantaauth.sharkservices075.workers.dev";
+const FRONTEND_URL = "https://vantaauth.xyz";
 
 // --- DATABASE CONNECTION ---
 if (!MONGO_URI) {
