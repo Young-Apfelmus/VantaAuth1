@@ -5,17 +5,23 @@ const bodyParser = require('body-parser');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const mongoose = require('mongoose');
+const axios = require('axios'); // REQUIREMENT: npm install axios
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- MONGODB CONNECTION ---
-const mongoUri = process.env.MONGO_URI;
+// --- CONFIGURATION ---
+const MONGO_URI = process.env.MONGO_URI;
+const DISCORD_CLIENT_ID = "1459637612246597916";
+const DISCORD_CLIENT_SECRET = "y3EwGJXiKnlBM9i-Zh-4goite4-FtGjD";
+const DISCORD_REDIRECT_URI = "https://vantaauth1.onrender.com/auth/discord/callback";
+const FRONTEND_URL = "https://vantaauth.sharkservices075.workers.dev";
 
-if (!mongoUri) {
+// --- DATABASE CONNECTION ---
+if (!MONGO_URI) {
     console.error("FATAL: MONGO_URI is missing in Environment Variables!");
 } else {
-    mongoose.connect(mongoUri)
+    mongoose.connect(MONGO_URI)
         .then(() => console.log("✅ Connected to MongoDB"))
         .catch(err => console.error("❌ MongoDB Connection Error:", err));
 }
@@ -27,7 +33,9 @@ app.use(bodyParser.json());
 
 const UserSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true },
-    password: { type: String, required: true }
+    password: { type: String, required: true },
+    discordId: { type: String, required: true }, // NEW: Link to Discord
+    knownIps: { type: [String], default: [] }    // NEW: IP Whitelist
 });
 const User = mongoose.model('User', UserSchema);
 
@@ -55,10 +63,9 @@ const KeySchema = new mongoose.Schema({
 });
 const KeyModel = mongoose.model('Key', KeySchema);
 
-// UPDATED: Log Schema now tracks the 'owner' to fix privacy issues
 const LogSchema = new mongoose.Schema({
     time: String,
-    owner: String, // NEW: Identifies who owns the app/script so only they see the log
+    owner: String,
     appId: String, 
     appName: String,
     key: String,   
@@ -87,7 +94,7 @@ const BlacklistSchema = new mongoose.Schema({
 const BlacklistModel = mongoose.model('Blacklist', BlacklistSchema);
 
 
-// --- HELPER ---
+// --- HELPER FUNCTIONS ---
 function generateId(len) { return crypto.randomBytes(len).toString('hex').slice(0, len); }
 function getTime() { return new Date().toISOString().replace('T', ' ').substring(0, 19); }
 
@@ -118,31 +125,124 @@ async function isBlacklisted(ip) {
     return true;
 }
 
+// --- DISCORD OAUTH2 HANDLER ---
+// 1. Get the Login URL
+app.get('/auth/discord/url', (req, res) => {
+    const url = `https://discord.com/api/oauth2/authorize?client_id=${DISCORD_CLIENT_ID}&redirect_uri=${encodeURIComponent(DISCORD_REDIRECT_URI)}&response_type=code&scope=identify`;
+    res.json({ url });
+});
 
-// --- AUTH ---
+// 2. Callback from Discord
+app.get('/auth/discord/callback', async (req, res) => {
+    const { code } = req.query;
+    if (!code) return res.send("No code provided.");
+
+    try {
+        // Exchange code for token
+        const tokenResponse = await axios.post(
+            'https://discord.com/api/oauth2/token',
+            new URLSearchParams({
+                client_id: DISCORD_CLIENT_ID,
+                client_secret: DISCORD_CLIENT_SECRET,
+                grant_type: 'authorization_code',
+                code,
+                redirect_uri: DISCORD_REDIRECT_URI
+            }),
+            { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+        );
+
+        const accessToken = tokenResponse.data.access_token;
+
+        // Get User Info
+        const userResponse = await axios.get('https://discord.com/api/users/@me', {
+            headers: { Authorization: `Bearer ${accessToken}` }
+        });
+
+        const discordUser = userResponse.data;
+        
+        // Encode data to pass back to frontend (Simple base64 for transport)
+        const payload = Buffer.from(JSON.stringify({
+            id: discordUser.id,
+            username: discordUser.username
+        })).toString('base64');
+
+        // Redirect back to frontend with the payload
+        res.redirect(`${FRONTEND_URL}?discord_auth=${payload}`);
+
+    } catch (e) {
+        console.error("Discord Auth Error:", e.response ? e.response.data : e.message);
+        res.send("Authentication Failed. Please try again.");
+    }
+});
+
+
+// --- AUTHENTICATION (UPDATED) ---
+
+// REGISTER: Now requires discordData (passed from frontend after OAuth)
 app.post('/api/register', async (req, res) => {
     try {
-        const { username, password } = req.body;
+        const { username, password, discordId } = req.body;
+        const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+
+        if (!discordId) return res.json({ success: false, message: "Discord Verification Missing" });
+
         const existingUser = await User.findOne({ username });
-        if (existingUser) return res.json({ success: false, message: "Taken" });
+        if (existingUser) return res.json({ success: false, message: "Username Taken" });
+        
+        // Check if Discord ID is already used
+        const existingDiscord = await User.findOne({ discordId });
+        if (existingDiscord) return res.json({ success: false, message: "Discord Account already linked to a user" });
+
         const hashedPassword = await bcrypt.hash(password, 10);
-        const newUser = new User({ username, password: hashedPassword });
+        
+        const newUser = new User({ 
+            username, 
+            password: hashedPassword,
+            discordId: discordId,
+            knownIps: [ip] // Save initial IP
+        });
+        
         await newUser.save();
         res.json({ success: true });
     } catch (e) {
+        console.error(e);
         res.status(500).json({ success: false, message: "Server Error" });
     }
 });
 
+// LOGIN: Checks IP and demands verification if new
 app.post('/api/login', async (req, res) => {
     try {
-        const { username, password } = req.body;
+        const { username, password, verificationDiscordId } = req.body;
+        const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+
         const user = await User.findOne({ username });
         if (!user || !(await bcrypt.compare(password, user.password))) {
-            return res.json({ success: false });
+            return res.json({ success: false, message: "Invalid Credentials" });
         }
+
+        // IP CHECK LOGIC
+        const isKnownIp = user.knownIps.includes(ip);
+
+        if (!isKnownIp) {
+            // If user provided a verification ID from the OAuth flow
+            if (verificationDiscordId) {
+                if (verificationDiscordId === user.discordId) {
+                    // VERIFIED: Add new IP to whitelist and allow login
+                    user.knownIps.push(ip);
+                    await user.save();
+                } else {
+                    return res.json({ success: false, message: "Wrong Discord Account! Use the one linked to this user." });
+                }
+            } else {
+                // Not verified yet, tell frontend to trigger Discord OAuth
+                return res.json({ success: false, requireVerification: true, message: "New IP detected. Please verify with Discord." });
+            }
+        }
+
         res.json({ success: true, username: user.username });
     } catch (e) {
+        console.error(e);
         res.status(500).json({ success: false });
     }
 });
@@ -168,13 +268,10 @@ app.post('/api/create-app', async (req, res) => {
     } catch (e) { res.json({ success: false }); }
 });
 
-// NEW: Delete App Endpoint
 app.post('/api/delete-app', async (req, res) => {
     try {
         const { id, owner } = req.body;
-        // Delete the app
         await AppModel.findOneAndDelete({ id: id, owner: owner });
-        // Optional: Delete keys associated with this app to clean up
         await KeyModel.deleteMany({ appId: id });
         res.json({ success: true });
     } catch (e) { res.json({ success: false }); }
@@ -215,23 +312,14 @@ app.post('/api/delete-key', async (req, res) => {
     } catch (e) { res.json({ success: false }); }
 });
 
-// --- DASHBOARD DATA (UPDATED FOR PRIVACY) ---
+// --- DASHBOARD DATA ---
 app.get('/api/dashboard-data', async (req, res) => {
     try {
         const { owner } = req.query;
-        
-        // 1. Apps
         const apps = await AppModel.find({ owner });
         const myAppIds = apps.map(a => a.id);
-        
-        // 2. Keys
         const myKeys = await KeyModel.find({ appId: { $in: myAppIds } }).sort({ createdAt: -1 });
-        
-        // 3. Logs (PRIVACY FIX)
-        // Only fetch logs where the 'owner' field matches the current user
-        // This ensures User A never sees User B's script execution logs
         const myLogs = await LogModel.find({ owner: owner }).sort({ createdAt: -1 }).limit(100);
-        
         res.json({ keys: myKeys, logs: myLogs });
     } catch (e) { res.json({ keys: [], logs: [] }); }
 });
@@ -291,7 +379,6 @@ app.post('/api/delete-script', async (req, res) => {
     } catch (e) { res.json({ success: false }); }
 });
 
-// --- RAW ENDPOINT (PRIVACY FIXED) ---
 app.get('/lua/:filename', async (req, res) => {
     try {
         const { filename } = req.params;
@@ -307,10 +394,9 @@ app.get('/lua/:filename', async (req, res) => {
              return res.send(`-- [[ ACCESS DENIED ]] --\n-- Protected by VantaAuth.`);
         }
 
-        // LOGGING FIX: Save the script owner's name in the log
         await LogModel.create({
             time: getTime(),
-            owner: script.owner, // <--- PRIVACY KEY: Links log to script owner
+            owner: script.owner,
             appId: "HOSTING",
             appName: `Script: ${script.userLabel}`,
             key: "N/A",
@@ -326,7 +412,7 @@ app.get('/lua/:filename', async (req, res) => {
 });
 
 
-// --- LUA VERIFY (PRIVACY FIXED) ---
+// --- LUA VERIFY ---
 app.get('/api/lua/loader', (req, res) => {
     const lua = `
 local Vanta = {}
@@ -366,7 +452,6 @@ app.post('/api/lua/verify', async (req, res) => {
         const appData = await AppModel.findOne({ id: appId });
         if (!appData || appData.secret !== secret) return res.json({ valid: false, message: "Invalid App/Secret" });
 
-        // LOGGING FIX: Save app owner in logs
         const logCommon = { time: getTime(), owner: appData.owner, appId, appName: appData.name, key, ip };
 
         const keyData = await KeyModel.findOne({ key: key });
