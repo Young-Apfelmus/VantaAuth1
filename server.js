@@ -22,7 +22,10 @@ if (!MONGO_URI) {
     console.error("FATAL: MONGO_URI is missing in Environment Variables!");
 } else {
     mongoose.connect(MONGO_URI)
-        .then(() => console.log("✅ Connected to MongoDB"))
+        .then(() => {
+            console.log("✅ Connected to MongoDB");
+            createOwnerAccount(); // Ensure Owner exists
+        })
         .catch(err => console.error("❌ MongoDB Connection Error:", err));
 }
 
@@ -30,7 +33,6 @@ app.use(cors());
 app.use(bodyParser.json());
 
 // --- HELPER: GET CLEAN IP ---
-// Fix für das "New IP Detected" Problem: Immer die erste echte IP nehmen
 function getClientIp(req) {
     const forwarded = req.headers['x-forwarded-for'];
     if (forwarded) {
@@ -44,8 +46,12 @@ function getClientIp(req) {
 const UserSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true },
     password: { type: String, required: true },
-    discordId: { type: String, required: true }, 
-    knownIps: { type: [String], default: [] }    
+    discordId: { type: String, required: false }, // Not required for Owner
+    knownIps: { type: [String], default: [] },
+    // New Fields
+    isPremium: { type: Boolean, default: false },
+    premiumExpiresAt: { type: Date, default: null },
+    createdAt: { type: Date, default: Date.now }
 });
 const User = mongoose.model('User', UserSchema);
 
@@ -135,6 +141,23 @@ async function isBlacklisted(ip) {
     return true;
 }
 
+// --- OWNER SEED ---
+async function createOwnerAccount() {
+    try {
+        const owner = await User.findOne({ username: "Owner" });
+        if (!owner) {
+            const hashedPassword = await bcrypt.hash("Owner", 10);
+            await User.create({
+                username: "Owner",
+                password: hashedPassword,
+                discordId: "OWNER-SYSTEM",
+                isPremium: true
+            });
+            console.log("👑 Owner Account Created (User: Owner / Pass: Owner)");
+        }
+    } catch (e) { console.error("Owner Seed Error", e); }
+}
+
 // --- DISCORD OAUTH2 HANDLER ---
 app.get('/auth/discord/url', (req, res) => {
     const url = `https://discord.com/api/oauth2/authorize?client_id=${DISCORD_CLIENT_ID}&redirect_uri=${encodeURIComponent(DISCORD_REDIRECT_URI)}&response_type=code&scope=identify`;
@@ -179,13 +202,12 @@ app.get('/auth/discord/callback', async (req, res) => {
 });
 
 
-// --- AUTHENTICATION (UPDATED) ---
+// --- AUTHENTICATION ---
 
-// REGISTER: Now returns username for Auto-Login
 app.post('/api/register', async (req, res) => {
     try {
         const { username, password, discordId } = req.body;
-        const ip = getClientIp(req); // USE UNIFIED IP HELPER
+        const ip = getClientIp(req); 
 
         if (!discordId) return res.json({ success: false, message: "Discord Verification Missing" });
 
@@ -201,27 +223,41 @@ app.post('/api/register', async (req, res) => {
             username, 
             password: hashedPassword,
             discordId: discordId,
-            knownIps: [ip] // Save the sanitized IP immediately
+            knownIps: [ip] 
         });
         
         await newUser.save();
-        // Return username so frontend can auto-login
-        res.json({ success: true, username: username });
+        res.json({ success: true, username: username, isPremium: false, premiumExpiresAt: null });
     } catch (e) {
         console.error(e);
         res.status(500).json({ success: false, message: "Server Error" });
     }
 });
 
-// LOGIN: Checks IP and demands verification if new
 app.post('/api/login', async (req, res) => {
     try {
         const { username, password, verificationDiscordId } = req.body;
-        const ip = getClientIp(req); // USE UNIFIED IP HELPER
+        const ip = getClientIp(req); 
 
         const user = await User.findOne({ username });
         if (!user || !(await bcrypt.compare(password, user.password))) {
             return res.json({ success: false, message: "Invalid Credentials" });
+        }
+
+        // Special bypass for Owner
+        if (username === "Owner") {
+             // Always update owner IP
+             if(!user.knownIps.includes(ip)) {
+                 user.knownIps.push(ip);
+                 await user.save();
+             }
+             return res.json({ 
+                 success: true, 
+                 username: "Owner", 
+                 isOwner: true,
+                 isPremium: true,
+                 premiumExpiresAt: null
+             });
         }
 
         // IP CHECK LOGIC
@@ -240,11 +276,113 @@ app.post('/api/login', async (req, res) => {
             }
         }
 
-        res.json({ success: true, username: user.username });
+        // Check Premium Expiry
+        if (user.isPremium && user.premiumExpiresAt) {
+            if (new Date() > new Date(user.premiumExpiresAt)) {
+                user.isPremium = false;
+                user.premiumExpiresAt = null;
+                await user.save();
+            }
+        }
+
+        res.json({ 
+            success: true, 
+            username: user.username,
+            isOwner: false,
+            isPremium: user.isPremium,
+            premiumExpiresAt: user.premiumExpiresAt
+        });
     } catch (e) {
         console.error(e);
         res.status(500).json({ success: false });
     }
+});
+
+// --- ADMIN API (OWNER ONLY) ---
+// Middleware helper for owner
+const ensureOwner = (req, res, next) => {
+    // In a real app, use Sessions/JWT. Here we rely on the client knowing the flow, 
+    // but we can pass the username in headers or body to basic check.
+    // For this simplified version, we'll check the 'requesting-user' header.
+    const user = req.headers['requesting-user'];
+    if(user === 'Owner') next();
+    else res.status(403).json({ success: false, message: "Forbidden" });
+};
+
+app.get('/api/admin/users', ensureOwner, async (req, res) => {
+    try {
+        // Fetch all users
+        const users = await User.find({}, 'username knownIps isPremium premiumExpiresAt discordId');
+        
+        // Map to format for frontend
+        const userList = users.map(u => ({
+            id: u._id,
+            username: u.username,
+            ips: u.knownIps,
+            isPremium: u.isPremium,
+            premiumExpiresAt: u.premiumExpiresAt,
+            discordId: u.discordId
+        }));
+        res.json(userList);
+    } catch (e) { res.json([]); }
+});
+
+app.post('/api/admin/set-premium', ensureOwner, async (req, res) => {
+    try {
+        const { targetUserId, durationType, customValue } = req.body;
+        const user = await User.findById(targetUserId);
+        if(!user) return res.json({ success: false, message: "User not found" });
+
+        if (durationType === "remove") {
+            user.isPremium = false;
+            user.premiumExpiresAt = null;
+        } else {
+            user.isPremium = true;
+            if (durationType === "lifetime") {
+                user.premiumExpiresAt = null;
+            } else {
+                const now = new Date();
+                let addTime = 0;
+                // Simple calculation based on rough ms
+                const hour = 3600 * 1000;
+                const day = 24 * hour;
+                
+                if (durationType === "hours") addTime = parseInt(customValue) * hour;
+                else if (durationType === "days") addTime = parseInt(customValue) * day;
+                else if (durationType === "weeks") addTime = parseInt(customValue) * 7 * day;
+                else if (durationType === "months") addTime = parseInt(customValue) * 30 * day;
+                
+                user.premiumExpiresAt = new Date(now.getTime() + addTime);
+            }
+        }
+        await user.save();
+        res.json({ success: true });
+    } catch(e) { res.json({ success: false }); }
+});
+
+app.post('/api/admin/ban-ip-list', ensureOwner, async (req, res) => {
+    try {
+        const { ips } = req.body;
+        if (!ips || !Array.isArray(ips)) return res.json({ success: false });
+        
+        for (const ip of ips) {
+             await BlacklistModel.findOneAndUpdate(
+                { ip },
+                { ip, expiresAt: null, reason: "Owner Ban" }, // Permanent ban
+                { upsert: true, new: true }
+            );
+        }
+        res.json({ success: true });
+    } catch(e) { res.json({ success: false }); }
+});
+
+app.post('/api/admin/unban-ip-list', ensureOwner, async (req, res) => {
+    try {
+        const { ips } = req.body;
+        if (!ips || !Array.isArray(ips)) return res.json({ success: false });
+        await BlacklistModel.deleteMany({ ip: { $in: ips } });
+        res.json({ success: true });
+    } catch(e) { res.json({ success: false }); }
 });
 
 
@@ -359,7 +497,12 @@ app.post('/api/save-script', async (req, res) => {
     try {
         const { owner, label, content } = req.body;
         const count = await ScriptModel.countDocuments({ owner });
-        if (count >= 5) return res.json({ success: false, message: "Limit reached (Max 5)" });
+        
+        // Check Premium for Limit
+        const user = await User.findOne({ username: owner });
+        const limit = (user && user.isPremium) ? 20 : 5; // Premium gets 20 scripts
+
+        if (count >= limit) return res.json({ success: false, message: `Limit reached (Max ${limit})` });
 
         const filename = `s-${generateId(6)}.lua`;
         const newScript = new ScriptModel({ owner, filename, userLabel: label, content });
@@ -379,7 +522,7 @@ app.post('/api/delete-script', async (req, res) => {
 app.get('/lua/:filename', async (req, res) => {
     try {
         const { filename } = req.params;
-        const ip = getClientIp(req); // IP CHECK
+        const ip = getClientIp(req); 
 
         if (await isBlacklisted(ip)) return res.status(403).send("-- [[ BANNED IP ]] --");
 
@@ -440,7 +583,7 @@ return Vanta
 });
 
 app.post('/api/lua/verify', async (req, res) => {
-    const ip = getClientIp(req); // IP CHECK
+    const ip = getClientIp(req); 
     const { appId, secret, key, hwid } = req.body;
 
     try {
