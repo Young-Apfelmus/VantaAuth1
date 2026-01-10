@@ -68,6 +68,16 @@ const LogSchema = new mongoose.Schema({
 });
 const LogModel = mongoose.model('Log', LogSchema);
 
+// --- NEW: SCRIPT SCHEMA (Hosting) ---
+const ScriptSchema = new mongoose.Schema({
+    owner: String,
+    filename: { type: String, unique: true }, // z.B. random "s-83jd92.lua"
+    userLabel: String, // Der Name, den der User eingibt
+    content: String,
+    createdAt: { type: Date, default: Date.now }
+});
+const ScriptModel = mongoose.model('Script', ScriptSchema);
+
 
 // --- HELPER ---
 function generateId(len) { return crypto.randomBytes(len).toString('hex').slice(0, len); }
@@ -78,17 +88,11 @@ function getTime() { return new Date().toISOString().replace('T', ' ').substring
 app.post('/api/register', async (req, res) => {
     try {
         const { username, password } = req.body;
-        
-        // Prüfen ob User existiert (DB Anfrage)
         const existingUser = await User.findOne({ username });
         if (existingUser) return res.json({ success: false, message: "Taken" });
-
         const hashedPassword = await bcrypt.hash(password, 10);
-        
-        // Neuen User in DB speichern
         const newUser = new User({ username, password: hashedPassword });
         await newUser.save();
-
         res.json({ success: true });
     } catch (e) {
         console.error(e);
@@ -100,7 +104,6 @@ app.post('/api/login', async (req, res) => {
     try {
         const { username, password } = req.body;
         const user = await User.findOne({ username });
-        
         if (!user || !(await bcrypt.compare(password, user.password))) {
             return res.json({ success: false });
         }
@@ -116,12 +119,9 @@ app.post('/api/login', async (req, res) => {
 app.get('/api/my-apps', async (req, res) => {
     try {
         const { owner } = req.query;
-        // Suche alle Apps des Owners in der DB
         const myApps = await AppModel.find({ owner });
         res.json(myApps);
-    } catch (e) {
-        res.json([]);
-    }
+    } catch (e) { res.json([]); }
 });
 
 app.post('/api/create-app', async (req, res) => {
@@ -129,21 +129,10 @@ app.post('/api/create-app', async (req, res) => {
         const { name, owner } = req.body;
         const appId = generateId(10);
         const secret = generateId(40); 
-        
-        const newApp = new AppModel({ 
-            id: appId, 
-            name, 
-            owner, 
-            secret, 
-            totalUsers: 0, 
-            onlineUsers: 0 
-        });
+        const newApp = new AppModel({ id: appId, name, owner, secret, totalUsers: 0, onlineUsers: 0 });
         await newApp.save();
-
         res.json({ success: true });
-    } catch (e) {
-        res.json({ success: false });
-    }
+    } catch (e) { res.json({ success: false }); }
 });
 
 
@@ -151,55 +140,110 @@ app.post('/api/create-app', async (req, res) => {
 app.post('/api/create-key', async (req, res) => {
     try {
         const { owner, appId } = req.body;
-        
-        // App suchen
         const application = await AppModel.findOne({ id: appId });
         if(!application) return res.json({ success: false });
 
         const keyStr = `VNT-${generateId(4).toUpperCase()}-${generateId(4).toUpperCase()}`;
-        
         const newKey = new KeyModel({
-            key: keyStr,
-            appId: appId,
-            appName: application.name,
-            generatedBy: owner,
-            hwid: null,
-            ip: null,
-            active: true
+            key: keyStr, appId: appId, appName: application.name, generatedBy: owner,
+            hwid: null, ip: null, active: true
         });
         await newKey.save();
-        
         res.json({ success: true, key: keyStr });
-    } catch (e) {
-        res.json({ success: false });
-    }
+    } catch (e) { res.json({ success: false }); }
 });
 
 app.get('/api/dashboard-data', async (req, res) => {
     try {
         const { owner } = req.query;
-        
-        // 1. Alle App-IDs des Users finden
         const apps = await AppModel.find({ owner });
         const myAppIds = apps.map(a => a.id);
-        
-        // 2. Keys und Logs aus DB laden, die zu diesen Apps gehören
-        // Sortierung: Neueste zuerst (createdAt: -1)
         const myKeys = await KeyModel.find({ appId: { $in: myAppIds } }).sort({ createdAt: -1 });
         const myLogs = await LogModel.find({ appId: { $in: myAppIds } }).sort({ createdAt: -1 }).limit(100);
-
         res.json({ keys: myKeys, logs: myLogs });
+    } catch (e) { res.json({ keys: [], logs: [] }); }
+});
+
+
+// --- SCRIPT HOSTING (NEW) ---
+
+// 1. Scripts des Users laden
+app.get('/api/my-scripts', async (req, res) => {
+    try {
+        const { owner } = req.query;
+        const scripts = await ScriptModel.find({ owner });
+        res.json(scripts);
+    } catch (e) { res.json([]); }
+});
+
+// 2. Script erstellen (Limit 5)
+app.post('/api/save-script', async (req, res) => {
+    try {
+        const { owner, label, content } = req.body;
+        
+        // Count check
+        const count = await ScriptModel.countDocuments({ owner });
+        if (count >= 5) return res.json({ success: false, message: "Limit reached (Max 5)" });
+
+        // Unique filename generieren (Random ID + .lua)
+        const filename = `s-${generateId(6)}.lua`;
+
+        const newScript = new ScriptModel({
+            owner,
+            filename,
+            userLabel: label,
+            content
+        });
+        await newScript.save();
+        res.json({ success: true });
     } catch (e) {
         console.error(e);
-        res.json({ keys: [], logs: [] });
+        res.json({ success: false, message: "Error saving script" });
+    }
+});
+
+// 3. Script löschen
+app.post('/api/delete-script', async (req, res) => {
+    try {
+        const { id, owner } = req.body; // id ist hier die interne _id oder filename
+        await ScriptModel.findOneAndDelete({ _id: id, owner });
+        res.json({ success: true });
+    } catch (e) { res.json({ success: false }); }
+});
+
+// 4. PUBLIC RAW ENDPOINT (Browser Protected)
+// URL: /lua/s-xxxxxx.lua
+app.get('/lua/:filename', async (req, res) => {
+    try {
+        const { filename } = req.params;
+        const script = await ScriptModel.findOne({ filename });
+
+        if (!script) return res.status(404).send("Script not found");
+
+        // --- BROWSER PROTECTION ---
+        const userAgent = req.headers['user-agent'] || '';
+        
+        // Browser senden fast immer "Mozilla". Executors oft nicht oder senden "Roblox".
+        // Wenn "Mozilla" drin ist, aber NICHT "Roblox", blockieren wir es.
+        if (userAgent.includes('Mozilla') && !userAgent.includes('Roblox')) {
+             return res.send(`-- [[ ACCESS DENIED ]]
+-- This script is protected by VantaAuth.
+-- It can only be executed within a Lua Executor.
+-- Please do not try to view the source in a browser.`);
+        }
+
+        // Wenn Executor -> Code senden
+        res.setHeader('Content-Type', 'text/plain');
+        res.send(script.content);
+
+    } catch (e) {
+        res.status(500).send("Error");
     }
 });
 
 
-// --- LUA VERIFY (Das Herzstück) ---
+// --- LUA VERIFY ---
 app.get('/api/lua/loader', (req, res) => {
-    // URL hardcoded wie im Original, aber dynamisch ist sicherer falls sich die Render URL ändert.
-    // Ich lasse es so wie du es hattest.
     const lua = `
 local Vanta = {}
 local Http = game:GetService("HttpService")
@@ -233,33 +277,25 @@ app.post('/api/lua/verify', async (req, res) => {
     const { appId, secret, key, hwid } = req.body;
 
     try {
-        // 1. App Check
         const appData = await AppModel.findOne({ id: appId });
         if (!appData || appData.secret !== secret) return res.json({ valid: false, message: "Invalid App/Secret" });
 
-        // 2. Key Check
         const keyData = await KeyModel.findOne({ key: key });
         if (!keyData) return res.json({ valid: false, message: "Invalid Key" });
         if (keyData.appId !== appId) return res.json({ valid: false, message: "Key not for this App" });
         if (!keyData.active) return res.json({ valid: false, message: "Key Banned" });
 
-        // 3. HWID & IP Logic
         if (!keyData.hwid) {
-            // Erster Login -> Binden
             keyData.hwid = hwid;
             keyData.ip = ip;
             await keyData.save();
-
-            // Stats updaten
             appData.totalUsers += 1;
             await appData.save();
         } else if (keyData.hwid !== hwid) {
-            // HWID Mismatch -> Loggen
             await LogModel.create({ time: getTime(), appId, appName: appData.name, key, ip, message: "HWID Mismatch Warning" });
             return res.json({ valid: false, message: "HWID Mismatch" });
         }
 
-        // Erfolgreicher Login -> Loggen
         await LogModel.create({ time: getTime(), appId, appName: appData.name, key, ip, message: "Login Success" });
         
         res.json({ valid: true, script: `print("Hello ${key} from ${appData.name}")` });
