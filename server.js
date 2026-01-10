@@ -49,6 +49,7 @@ const UserSchema = new mongoose.Schema({
     discordId: { type: String, required: false }, // Not required for Owner
     knownIps: { type: [String], default: [] },
     // New Fields
+	isOwner: { type: Boolean, default: false }, // <--- NEU
     isPremium: { type: Boolean, default: false },
     premiumExpiresAt: { type: Date, default: null },
     createdAt: { type: Date, default: Date.now }
@@ -151,7 +152,8 @@ async function createOwnerAccount() {
                 username: "Owner",
                 password: hashedPassword,
                 discordId: "OWNER-SYSTEM",
-                isPremium: true
+                isPremium: true,
+                isOwner: true // <--- NEU: Der Ur-Owner muss das Flag haben
             });
             console.log("👑 Owner Account Created (User: Owner / Pass: Owner)");
         }
@@ -244,8 +246,8 @@ app.post('/api/login', async (req, res) => {
             return res.json({ success: false, message: "Invalid Credentials" });
         }
 
-        // Special bypass for Owner
-        if (username === "Owner") {
+        // Special bypass for Owner / Admins
+        if (user.isOwner === true) {
              // Always update owner IP
              if(!user.knownIps.includes(ip)) {
                  user.knownIps.push(ip);
@@ -253,8 +255,8 @@ app.post('/api/login', async (req, res) => {
              }
              return res.json({ 
                  success: true, 
-                 username: "Owner", 
-                 isOwner: true,
+                 username: user.username, 
+                 isOwner: true, // <--- WICHTIG
                  isPremium: true,
                  premiumExpiresAt: null
              });
@@ -299,20 +301,23 @@ app.post('/api/login', async (req, res) => {
 });
 
 // --- ADMIN API (OWNER ONLY) ---
-// Middleware helper for owner
-const ensureOwner = (req, res, next) => {
-    // In a real app, use Sessions/JWT. Here we rely on the client knowing the flow, 
-    // but we can pass the username in headers or body to basic check.
-    // For this simplified version, we'll check the 'requesting-user' header.
-    const user = req.headers['requesting-user'];
-    if(user === 'Owner') next();
-    else res.status(403).json({ success: false, message: "Forbidden" });
+const ensureOwner = async (req, res, next) => {
+    const username = req.headers['requesting-user'];
+    if(!username) return res.status(403).json({ success: false, message: "Forbidden" });
+    
+    // Prüfen, ob der User in der DB wirklich Owner ist
+    const user = await User.findOne({ username });
+    if(user && user.isOwner) {
+        next();
+    } else {
+        res.status(403).json({ success: false, message: "Forbidden" });
+    }
 };
 
 app.get('/api/admin/users', ensureOwner, async (req, res) => {
     try {
         // Fetch all users
-        const users = await User.find({}, 'username knownIps isPremium premiumExpiresAt discordId');
+        const users = await User.find({}, 'username knownIps isPremium premiumExpiresAt discordId isOwner');
         
         // Map to format for frontend
         const userList = users.map(u => ({
@@ -320,6 +325,7 @@ app.get('/api/admin/users', ensureOwner, async (req, res) => {
             username: u.username,
             ips: u.knownIps,
             isPremium: u.isPremium,
+            isOwner: u.isOwner, // <--- NEU
             premiumExpiresAt: u.premiumExpiresAt,
             discordId: u.discordId
         }));
@@ -381,6 +387,23 @@ app.post('/api/admin/unban-ip-list', ensureOwner, async (req, res) => {
         const { ips } = req.body;
         if (!ips || !Array.isArray(ips)) return res.json({ success: false });
         await BlacklistModel.deleteMany({ ip: { $in: ips } });
+        res.json({ success: true });
+    } catch(e) { res.json({ success: false }); }
+});
+
+app.post('/api/admin/toggle-owner', ensureOwner, async (req, res) => {
+    try {
+        const { targetUserId, makeOwner } = req.body;
+        const user = await User.findById(targetUserId);
+        
+        if(!user) return res.json({ success: false, message: "User not found" });
+        if(user.username === "Owner") return res.json({ success: false, message: "Cannot change Root Owner" });
+
+        user.isOwner = makeOwner;
+        // Owners should automatically be Premium
+        if(makeOwner) user.isPremium = true; 
+        
+        await user.save();
         res.json({ success: true });
     } catch(e) { res.json({ success: false }); }
 });
