@@ -25,14 +25,12 @@ app.use(bodyParser.json());
 
 // --- DATABASE SCHEMAS ---
 
-// User Schema
 const UserSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true },
     password: { type: String, required: true }
 });
 const User = mongoose.model('User', UserSchema);
 
-// App Schema
 const AppSchema = new mongoose.Schema({
     id: { type: String, unique: true },
     name: String,
@@ -43,7 +41,6 @@ const AppSchema = new mongoose.Schema({
 });
 const AppModel = mongoose.model('App', AppSchema);
 
-// Key Schema (Updated with Expiry)
 const KeySchema = new mongoose.Schema({
     key: { type: String, unique: true },
     appId: String,
@@ -52,26 +49,26 @@ const KeySchema = new mongoose.Schema({
     hwid: { type: String, default: null },
     ip: { type: String, default: null },
     active: { type: Boolean, default: true },
-    expiresAt: { type: Date, default: null }, // Null = Lifetime
+    expiresAt: { type: Date, default: null }, 
     durationLabel: { type: String, default: "Lifetime" },
     createdAt: { type: Date, default: Date.now }
 });
 const KeyModel = mongoose.model('Key', KeySchema);
 
-// Log Schema
+// UPDATED: Log Schema now tracks the 'owner' to fix privacy issues
 const LogSchema = new mongoose.Schema({
     time: String,
-    appId: String, // Can be "HOSTING" for script hosting logs
+    owner: String, // NEW: Identifies who owns the app/script so only they see the log
+    appId: String, 
     appName: String,
-    key: String,   // Can be "N/A" for script hosting
+    key: String,   
     ip: String,
     message: String,
-    type: { type: String, default: "auth" }, // "auth" or "execution"
+    type: { type: String, default: "auth" }, 
     createdAt: { type: Date, default: Date.now }
 });
 const LogModel = mongoose.model('Log', LogSchema);
 
-// Script Schema
 const ScriptSchema = new mongoose.Schema({
     owner: String,
     filename: { type: String, unique: true }, 
@@ -81,11 +78,10 @@ const ScriptSchema = new mongoose.Schema({
 });
 const ScriptModel = mongoose.model('Script', ScriptSchema);
 
-// NEW: Blacklist Schema
 const BlacklistSchema = new mongoose.Schema({
     ip: { type: String, required: true, unique: true },
     reason: String,
-    expiresAt: { type: Date, default: null }, // Null = Perm
+    expiresAt: { type: Date, default: null }, 
     createdAt: { type: Date, default: Date.now }
 });
 const BlacklistModel = mongoose.model('Blacklist', BlacklistSchema);
@@ -95,11 +91,9 @@ const BlacklistModel = mongoose.model('Blacklist', BlacklistSchema);
 function generateId(len) { return crypto.randomBytes(len).toString('hex').slice(0, len); }
 function getTime() { return new Date().toISOString().replace('T', ' ').substring(0, 19); }
 
-// Helper: Calculate Expiration Date
 function calculateExpiry(type, customDays) {
     const now = new Date();
     if (type === 'lifetime') return null;
-    
     let daysToAdd = 0;
     if (type === '1d') daysToAdd = 1;
     else if (type === '3d') daysToAdd = 3;
@@ -108,19 +102,15 @@ function calculateExpiry(type, customDays) {
     else if (type === '1y') daysToAdd = 365;
     else if (type === '5y') daysToAdd = 365 * 5;
     else if (type === 'custom') daysToAdd = parseInt(customDays) || 0;
-
-    if (daysToAdd === 0) return null; // Fallback to lifetime if 0
-
+    if (daysToAdd === 0) return null; 
     const expiryDate = new Date(now);
     expiryDate.setDate(expiryDate.getDate() + daysToAdd);
     return expiryDate;
 }
 
-// Helper: Check Blacklist
 async function isBlacklisted(ip) {
     const entry = await BlacklistModel.findOne({ ip });
     if (!entry) return false;
-    // Check if ban expired
     if (entry.expiresAt && new Date() > entry.expiresAt) {
         await BlacklistModel.deleteOne({ ip });
         return false;
@@ -178,8 +168,20 @@ app.post('/api/create-app', async (req, res) => {
     } catch (e) { res.json({ success: false }); }
 });
 
+// NEW: Delete App Endpoint
+app.post('/api/delete-app', async (req, res) => {
+    try {
+        const { id, owner } = req.body;
+        // Delete the app
+        await AppModel.findOneAndDelete({ id: id, owner: owner });
+        // Optional: Delete keys associated with this app to clean up
+        await KeyModel.deleteMany({ appId: id });
+        res.json({ success: true });
+    } catch (e) { res.json({ success: false }); }
+});
 
-// --- KEY MANAGEMENT (UPDATED) ---
+
+// --- KEY MANAGEMENT ---
 app.post('/api/create-key', async (req, res) => {
     try {
         const { owner, appId, durationType, customDays } = req.body;
@@ -187,8 +189,6 @@ app.post('/api/create-key', async (req, res) => {
         if(!application) return res.json({ success: false });
 
         const keyStr = `VNT-${generateId(4).toUpperCase()}-${generateId(4).toUpperCase()}`;
-        
-        // Calculate Expiry
         const expiresAt = calculateExpiry(durationType, customDays);
         let label = durationType === 'custom' ? `${customDays} Days` : durationType.toUpperCase();
         if(!expiresAt) label = "Lifetime";
@@ -210,38 +210,27 @@ app.post('/api/create-key', async (req, res) => {
 app.post('/api/delete-key', async (req, res) => {
     try {
         const { id, owner } = req.body;
-        // Verify ownership indirectly or assume admin logic implies access
-        // Ideally check if App owner matches, but for simplicity:
         await KeyModel.findOneAndDelete({ _id: id });
         res.json({ success: true });
     } catch (e) { res.json({ success: false }); }
 });
 
-// --- DASHBOARD DATA ---
+// --- DASHBOARD DATA (UPDATED FOR PRIVACY) ---
 app.get('/api/dashboard-data', async (req, res) => {
     try {
         const { owner } = req.query;
-        // 1. Apps owned by user
+        
+        // 1. Apps
         const apps = await AppModel.find({ owner });
         const myAppIds = apps.map(a => a.id);
         
-        // 2. Keys for those apps
+        // 2. Keys
         const myKeys = await KeyModel.find({ appId: { $in: myAppIds } }).sort({ createdAt: -1 });
         
-        // 3. Logs: Either for the Apps OR Script Hosting (where appId="HOSTING" and owner matches somehow)
-        // Since Script Logs don't link easily to "owner" without looking up the filename owner,
-        // we will fetch logs where appName matches one of the user's apps OR appId is HOSTING (we need to filter hosting logs better in a real app, but here we show all logs for simplicity or filter by name).
-        
-        // To keep it simple: We fetch logs where appId is in myAppIds OR (appId="HOSTING" and message contains script name owned by user).
-        // For this demo, we just return logs for the APPS + All Hosting logs (if you want better privacy, you'd filter hosting logs by script ownership).
-        // Let's stick to App Logs for safety + Hosting logs if simple.
-        
-        const myLogs = await LogModel.find({ 
-            $or: [
-                { appId: { $in: myAppIds } },
-                { appId: "HOSTING" } // Showing all script executions for now, can be filtered if needed
-            ]
-        }).sort({ createdAt: -1 }).limit(100);
+        // 3. Logs (PRIVACY FIX)
+        // Only fetch logs where the 'owner' field matches the current user
+        // This ensures User A never sees User B's script execution logs
+        const myLogs = await LogModel.find({ owner: owner }).sort({ createdAt: -1 }).limit(100);
         
         res.json({ keys: myKeys, logs: myLogs });
     } catch (e) { res.json({ keys: [], logs: [] }); }
@@ -261,7 +250,6 @@ app.post('/api/ban-ip', async (req, res) => {
             expires.setDate(expires.getDate() + days);
         }
 
-        // Upsert (Update if exists, else insert)
         await BlacklistModel.findOneAndUpdate(
             { ip },
             { ip, expiresAt: expires, reason: "Manual Ban" },
@@ -269,10 +257,7 @@ app.post('/api/ban-ip', async (req, res) => {
         );
 
         res.json({ success: true });
-    } catch(e) {
-        console.error(e);
-        res.json({ success: false });
-    }
+    } catch(e) { res.json({ success: false }); }
 });
 
 
@@ -306,30 +291,26 @@ app.post('/api/delete-script', async (req, res) => {
     } catch (e) { res.json({ success: false }); }
 });
 
-// --- PUBLIC RAW ENDPOINT (UPDATED WITH LOGGING & BLACKLIST) ---
+// --- RAW ENDPOINT (PRIVACY FIXED) ---
 app.get('/lua/:filename', async (req, res) => {
     try {
         const { filename } = req.params;
         const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
 
-        // 1. Check Blacklist
-        if (await isBlacklisted(ip)) {
-            return res.status(403).send("-- [[ BANNED IP ]] --");
-        }
+        if (await isBlacklisted(ip)) return res.status(403).send("-- [[ BANNED IP ]] --");
 
         const script = await ScriptModel.findOne({ filename });
         if (!script) return res.status(404).send("Script not found");
 
-        // 2. Browser Protection
         const userAgent = req.headers['user-agent'] || '';
         if (userAgent.includes('Mozilla') && !userAgent.includes('Roblox')) {
              return res.send(`-- [[ ACCESS DENIED ]] --\n-- Protected by VantaAuth.`);
         }
 
-        // 3. Log Execution
-        // We log it so it appears in Live Logs
+        // LOGGING FIX: Save the script owner's name in the log
         await LogModel.create({
             time: getTime(),
+            owner: script.owner, // <--- PRIVACY KEY: Links log to script owner
             appId: "HOSTING",
             appName: `Script: ${script.userLabel}`,
             key: "N/A",
@@ -341,15 +322,12 @@ app.get('/lua/:filename', async (req, res) => {
         res.setHeader('Content-Type', 'text/plain');
         res.send(script.content);
 
-    } catch (e) {
-        res.status(500).send("Error");
-    }
+    } catch (e) { res.status(500).send("Error"); }
 });
 
 
-// --- LUA VERIFY (UPDATED) ---
+// --- LUA VERIFY (PRIVACY FIXED) ---
 app.get('/api/lua/loader', (req, res) => {
-    // Standard loader code (unchanged logic)
     const lua = `
 local Vanta = {}
 local Http = game:GetService("HttpService")
@@ -383,25 +361,23 @@ app.post('/api/lua/verify', async (req, res) => {
     const { appId, secret, key, hwid } = req.body;
 
     try {
-        // 1. Check Blacklist
-        if (await isBlacklisted(ip)) {
-            return res.json({ valid: false, message: "IP Banned" });
-        }
+        if (await isBlacklisted(ip)) return res.json({ valid: false, message: "IP Banned" });
 
         const appData = await AppModel.findOne({ id: appId });
         if (!appData || appData.secret !== secret) return res.json({ valid: false, message: "Invalid App/Secret" });
+
+        // LOGGING FIX: Save app owner in logs
+        const logCommon = { time: getTime(), owner: appData.owner, appId, appName: appData.name, key, ip };
 
         const keyData = await KeyModel.findOne({ key: key });
         if (!keyData) return res.json({ valid: false, message: "Invalid Key" });
         if (keyData.appId !== appId) return res.json({ valid: false, message: "Key not for this App" });
         if (!keyData.active) return res.json({ valid: false, message: "Key Banned" });
 
-        // 2. Check Expiry
         if (keyData.expiresAt && new Date() > new Date(keyData.expiresAt)) {
             return res.json({ valid: false, message: "Key Expired" });
         }
 
-        // 3. HWID Lock
         if (!keyData.hwid) {
             keyData.hwid = hwid;
             keyData.ip = ip;
@@ -409,12 +385,11 @@ app.post('/api/lua/verify', async (req, res) => {
             appData.totalUsers += 1;
             await appData.save();
         } else if (keyData.hwid !== hwid) {
-            await LogModel.create({ time: getTime(), appId, appName: appData.name, key, ip, message: "HWID Mismatch Warning" });
+            await LogModel.create({ ...logCommon, message: "HWID Mismatch Warning" });
             return res.json({ valid: false, message: "HWID Mismatch" });
         }
 
-        // Success Log
-        await LogModel.create({ time: getTime(), appId, appName: appData.name, key, ip, message: "Login Success", type: "auth" });
+        await LogModel.create({ ...logCommon, message: "Login Success", type: "auth" });
         
         res.json({ valid: true, script: `print("Hello ${key} from ${appData.name}")` });
 
