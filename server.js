@@ -142,20 +142,30 @@ async function isBlacklisted(ip) {
     return true;
 }
 
-// --- OWNER SEED ---
+// --- OWNER SEED (Reparatur-Version) ---
 async function createOwnerAccount() {
     try {
-        const owner = await User.findOne({ username: "Owner" });
+        let owner = await User.findOne({ username: "Owner" });
+        
         if (!owner) {
+            // Wenn Owner noch gar nicht existiert -> Erstellen
             const hashedPassword = await bcrypt.hash("Owner", 10);
             await User.create({
                 username: "Owner",
                 password: hashedPassword,
                 discordId: "OWNER-SYSTEM",
                 isPremium: true,
-                isOwner: true // <--- NEU: Der Ur-Owner muss das Flag haben
+                isOwner: true // Wichtig!
             });
-            console.log("👑 Owner Account Created (User: Owner / Pass: Owner)");
+            console.log("👑 Owner Account Created");
+        } else {
+            // Wenn Owner existiert, aber vielleicht das Flag fehlt -> UPDATEN
+            if (!owner.isOwner) {
+                owner.isOwner = true;
+                owner.isPremium = true;
+                await owner.save();
+                console.log("👑 Owner Account Repaired (isOwner flag added)");
+            }
         }
     } catch (e) { console.error("Owner Seed Error", e); }
 }
