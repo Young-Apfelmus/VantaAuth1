@@ -5,7 +5,7 @@ const bodyParser = require('body-parser');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const mongoose = require('mongoose');
-const axios = require('axios'); // REQUIREMENT: npm install axios
+const axios = require('axios'); 
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -29,13 +29,23 @@ if (!MONGO_URI) {
 app.use(cors());
 app.use(bodyParser.json());
 
+// --- HELPER: GET CLEAN IP ---
+// Fix für das "New IP Detected" Problem: Immer die erste echte IP nehmen
+function getClientIp(req) {
+    const forwarded = req.headers['x-forwarded-for'];
+    if (forwarded) {
+        return forwarded.split(',')[0].trim();
+    }
+    return req.socket.remoteAddress;
+}
+
 // --- DATABASE SCHEMAS ---
 
 const UserSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true },
     password: { type: String, required: true },
-    discordId: { type: String, required: true }, // NEW: Link to Discord
-    knownIps: { type: [String], default: [] }    // NEW: IP Whitelist
+    discordId: { type: String, required: true }, 
+    knownIps: { type: [String], default: [] }    
 });
 const User = mongoose.model('User', UserSchema);
 
@@ -126,19 +136,16 @@ async function isBlacklisted(ip) {
 }
 
 // --- DISCORD OAUTH2 HANDLER ---
-// 1. Get the Login URL
 app.get('/auth/discord/url', (req, res) => {
     const url = `https://discord.com/api/oauth2/authorize?client_id=${DISCORD_CLIENT_ID}&redirect_uri=${encodeURIComponent(DISCORD_REDIRECT_URI)}&response_type=code&scope=identify`;
     res.json({ url });
 });
 
-// 2. Callback from Discord
 app.get('/auth/discord/callback', async (req, res) => {
     const { code } = req.query;
     if (!code) return res.send("No code provided.");
 
     try {
-        // Exchange code for token
         const tokenResponse = await axios.post(
             'https://discord.com/api/oauth2/token',
             new URLSearchParams({
@@ -152,21 +159,17 @@ app.get('/auth/discord/callback', async (req, res) => {
         );
 
         const accessToken = tokenResponse.data.access_token;
-
-        // Get User Info
         const userResponse = await axios.get('https://discord.com/api/users/@me', {
             headers: { Authorization: `Bearer ${accessToken}` }
         });
 
         const discordUser = userResponse.data;
         
-        // Encode data to pass back to frontend (Simple base64 for transport)
         const payload = Buffer.from(JSON.stringify({
             id: discordUser.id,
             username: discordUser.username
         })).toString('base64');
 
-        // Redirect back to frontend with the payload
         res.redirect(`${FRONTEND_URL}?discord_auth=${payload}`);
 
     } catch (e) {
@@ -178,18 +181,17 @@ app.get('/auth/discord/callback', async (req, res) => {
 
 // --- AUTHENTICATION (UPDATED) ---
 
-// REGISTER: Now requires discordData (passed from frontend after OAuth)
+// REGISTER: Now returns username for Auto-Login
 app.post('/api/register', async (req, res) => {
     try {
         const { username, password, discordId } = req.body;
-        const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+        const ip = getClientIp(req); // USE UNIFIED IP HELPER
 
         if (!discordId) return res.json({ success: false, message: "Discord Verification Missing" });
 
         const existingUser = await User.findOne({ username });
         if (existingUser) return res.json({ success: false, message: "Username Taken" });
         
-        // Check if Discord ID is already used
         const existingDiscord = await User.findOne({ discordId });
         if (existingDiscord) return res.json({ success: false, message: "Discord Account already linked to a user" });
 
@@ -199,11 +201,12 @@ app.post('/api/register', async (req, res) => {
             username, 
             password: hashedPassword,
             discordId: discordId,
-            knownIps: [ip] // Save initial IP
+            knownIps: [ip] // Save the sanitized IP immediately
         });
         
         await newUser.save();
-        res.json({ success: true });
+        // Return username so frontend can auto-login
+        res.json({ success: true, username: username });
     } catch (e) {
         console.error(e);
         res.status(500).json({ success: false, message: "Server Error" });
@@ -214,7 +217,7 @@ app.post('/api/register', async (req, res) => {
 app.post('/api/login', async (req, res) => {
     try {
         const { username, password, verificationDiscordId } = req.body;
-        const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+        const ip = getClientIp(req); // USE UNIFIED IP HELPER
 
         const user = await User.findOne({ username });
         if (!user || !(await bcrypt.compare(password, user.password))) {
@@ -225,17 +228,14 @@ app.post('/api/login', async (req, res) => {
         const isKnownIp = user.knownIps.includes(ip);
 
         if (!isKnownIp) {
-            // If user provided a verification ID from the OAuth flow
             if (verificationDiscordId) {
                 if (verificationDiscordId === user.discordId) {
-                    // VERIFIED: Add new IP to whitelist and allow login
                     user.knownIps.push(ip);
                     await user.save();
                 } else {
                     return res.json({ success: false, message: "Wrong Discord Account! Use the one linked to this user." });
                 }
             } else {
-                // Not verified yet, tell frontend to trigger Discord OAuth
                 return res.json({ success: false, requireVerification: true, message: "New IP detected. Please verify with Discord." });
             }
         }
@@ -330,20 +330,17 @@ app.post('/api/ban-ip', async (req, res) => {
     try {
         const { ip, durationDays } = req.body;
         if(!ip) return res.json({ success: false, message: "No IP" });
-
         const days = parseInt(durationDays);
         let expires = null;
         if(days > 0) {
             expires = new Date();
             expires.setDate(expires.getDate() + days);
         }
-
         await BlacklistModel.findOneAndUpdate(
             { ip },
             { ip, expiresAt: expires, reason: "Manual Ban" },
             { upsert: true, new: true }
         );
-
         res.json({ success: true });
     } catch(e) { res.json({ success: false }); }
 });
@@ -382,7 +379,7 @@ app.post('/api/delete-script', async (req, res) => {
 app.get('/lua/:filename', async (req, res) => {
     try {
         const { filename } = req.params;
-        const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+        const ip = getClientIp(req); // IP CHECK
 
         if (await isBlacklisted(ip)) return res.status(403).send("-- [[ BANNED IP ]] --");
 
@@ -443,7 +440,7 @@ return Vanta
 });
 
 app.post('/api/lua/verify', async (req, res) => {
-    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    const ip = getClientIp(req); // IP CHECK
     const { appId, secret, key, hwid } = req.body;
 
     try {
